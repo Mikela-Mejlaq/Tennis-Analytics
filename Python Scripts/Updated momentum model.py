@@ -16,7 +16,7 @@ Created on Sat Feb  7 18:18:59 2026
 # -*- coding: utf-8 -*-
 
 """
-Momentum AI Tool (Power BI–friendly)
+Momentum AI Tool
 
 Function
 - Downloads Slam point-by-point + matches files (Jeff Sackmann tennis_slam_pointbypoint)
