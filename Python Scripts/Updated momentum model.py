@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-"""
-@author: mikelamejlaq
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Created on Sat Feb  7 18:18:59 2026
 
@@ -436,8 +430,8 @@ def compute_momentum_for_match(df_match: pd.DataFrame, expected_model: Pipeline,
     df["leverage"] = [
         leverage_weight(sb, tb) for sb, tb in zip(df["score_bucket"], df["is_tiebreak"])
     ]
-    df["surprise"] = (df["focus_actual_win"] - df["focus_exp_win"]).astype(float)
-    df["swing_value"] = MOMENTUM_SCALE * df["leverage"] * df["surprise"]
+    df["pred_error"] = (df["focus_actual_win"] - df["focus_exp_win"]).astype(float)
+    df["swing_value"] = MOMENTUM_SCALE * df["leverage"] * df["pred_error"]
 
     # Momentum recursion
     m = 0.0
@@ -595,7 +589,7 @@ def build_momentum_tables(
             "score_str_server", "score_bucket",
             "serve_number", "speed_bucket", "serve_speed_kmh",
             "focus_actual_win", "focus_exp_win",
-            "leverage", "surprise", "swing_value",
+            "leverage", "pred_error", "swing_value",
             "momentum_index", "momentum_phase",
             "just_won_big", "just_lost_big",
             "mental_cue"
@@ -735,10 +729,6 @@ if __name__ == "__main__":
 
 print("\nmodel evaluation\n")
 
-# ----------------------------
-# 1) Expected Point Win Model
-#    Evaluate on a sample (fast + statistically stable)
-# ----------------------------
 feature_cols = ["surface", "score_bucket", "speed_bucket", "serve_number"]
 
 # Sample up to N points for evaluation
@@ -768,6 +758,4 @@ plt.xlabel("Predicted Probability")
 plt.ylabel("Observed Frequency")
 plt.tight_layout()
 plt.show()
-
-
 
