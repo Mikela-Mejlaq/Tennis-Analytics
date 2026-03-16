@@ -4,836 +4,770 @@
 """
 @author: mikelamejlaq
 
-Break-Point Forecasts
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Feb  7 18:18:59 2026
 
-Predicts for a given player vs opponent (or opponent-type):
-  - Expected BP Created
-  - Expected BP Converted + conversion probability
-  - Expected BP Faced
-  - Expected BP Saved + save probability
+@author: mikelamejlaq
 """
 
-# %% Importing packages
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import warnings
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
-from pathlib import Path
+"""
+Momentum AI Tool (Power BI–friendly)
 
+Function
+- Downloads Slam point-by-point + matches files (Jeff Sackmann tennis_slam_pointbypoint)
+- Robustly merges points with matches (handles match_id dtype issues + slam/year duplicates)
+- Trains a global expected-point-win model (logistic regression)
+- Builds a decayed Momentum Index per point for a chosen focus player:
+      m_t = decay*m_{t-1} + scale * leverage * (actual - expected)
+- Outputs TWO CSVs for Power BI:
+      1) momentum_points_long.csv  (fact table; 1 row per point per focus player)
+      2) momentum_match_summary.csv (1 row per match per focus player)
+- Plots a match momentum time series in Spyder (state graph)
+
+Important
+- The most common reason “no data matched filters” happens is because you picked years
+  that don’t contain the player. This script auto-diagnoses and auto-broadens safely.
+
+"""
+
+import os
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from typing import List, Optional, Tuple
 
-from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import PoissonRegressor, LogisticRegression
-from sklearn.cluster import KMeans
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_absolute_error
-
-warnings.filterwarnings("ignore")
-
-# %% Setting parameters
-
-@dataclass
-class Config:
-    START_YEAR: int = 2005
-    END_YEAR: int = 2025
-
-    ROLLING_WINDOW: int = 20
-    MIN_HISTORY_MATCHES: int = 8
-
-    N_STYLE_CLUSTERS: int = 4
-    BINOMIAL_EXPAND_CAP: int = 30
-
-    DROP_MISSING_BP_STATS: bool = True
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.calibration import calibration_curve
 
 
-CFG = Config()
+#%% Setting paramters
 
-ATP_BASE = "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/"
-MCP_BASE = "https://raw.githubusercontent.com/JeffSackmann/tennis_MatchChartingProject/master/"
+SLAM_BASE = "https://raw.githubusercontent.com/JeffSackmann/tennis_slam_pointbypoint/master/"
+CACHE_DIR = "./slam_cache"
+EXPORT_DIR = "./powerbi_exports"
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(EXPORT_DIR, exist_ok=True)
 
-serve_basics_url     = MCP_BASE + "charting-m-stats-ServeBasics.csv"
-keypoints_serve_url  = MCP_BASE + "charting-m-stats-KeyPointsServe.csv"
-keypoints_return_url = MCP_BASE + "charting-m-stats-KeyPointsReturn.csv"
+SLAM_TO_SURFACE = {
+    "ausopen": "Hard",
+    "frenchopen": "Clay",
+    "wimbledon": "Grass",
+    "usopen": "Hard",
+}
 
-# Power BI outputs
-OUT_DIR_NAME = "powerbi_exports"
-OUT_PREDICTIONS = "bp_predictions.csv"
-OUT_FEATURE_SCHEMA = "bp_feature_schema.csv"
-OUT_PLAYER_STYLES = "bp_player_styles.csv"
-OUT_LATEST_SNAPSHOT = "bp_latest_snapshot.csv"
+# Momentum parameters (can be tuned if necessary)
+MOMENTUM_DECAY = 0.92
+MOMENTUM_SCALE = 12.0
+CLIP_MOMENTUM = 20.0
 
-# %% 1) MCP style clusters
+LEVERAGE_BREAKPOINT = 1.60
+LEVERAGE_GAMEPOINT = 1.30
+LEVERAGE_DEUCE = 1.15
+LEVERAGE_TB = 1.25
+LEVERAGE_DEFAULT = 1.00
 
-def build_player_style_clusters(cfg: Config) -> Dict[str, str]:
-    serve_basics     = pd.read_csv(serve_basics_url)
-    keypoints_serve  = pd.read_csv(keypoints_serve_url)
-    keypoints_return = pd.read_csv(keypoints_return_url)
+# Phase thresholds
+PHASE_POS_DOMINANT = 6.0
+PHASE_POS_EDGE = 2.0
+PHASE_NEG_EDGE = -2.0
+PHASE_NEG_DOMINANT = -6.0
 
-    sb = serve_basics.copy()
-    sb["pts"] = sb["pts"].replace(0, np.nan)
-    sb["unreturned_pct"]  = sb["unret"] / sb["pts"]
-    sb["ace_rate"]        = sb["aces"] / sb["pts"]
-    sb["short_point_pct"] = sb["pts_won_lte_3_shots"] / sb["pts"]
 
-    serve_summary = sb.groupby("player").agg({
-        "unreturned_pct": "mean",
-        "ace_rate": "mean",
-        "short_point_pct": "mean"
-    }).reset_index()
+#%% Helper Functions
+def _cache_path(filename: str) -> str:
+    return os.path.join(CACHE_DIR, filename)
 
-    ks = keypoints_serve.copy()
-    kr = keypoints_return.copy()
-    ks["pts"] = ks["pts"].replace(0, np.nan)
-    kr["pts"] = kr["pts"].replace(0, np.nan)
+def read_csv_cached(url: str, filename: str, low_memory: bool = True) -> pd.DataFrame:
+    """
+    Read from local cache if exists; else download and cache.
+    """
+    path = _cache_path(filename)
+    if os.path.exists(path):
+        return pd.read_csv(path, low_memory=low_memory)
+    df = pd.read_csv(url, low_memory=low_memory)
+    df.to_csv(path, index=False)
+    return df
 
-    ks["pressure_serve_win_pct"]  = ks["pts_won"] / ks["pts"]
-    kr["pressure_return_win_pct"] = kr["pts_won"] / kr["pts"]
 
-    pressure_summary = ks.groupby("player").agg({
-        "pressure_serve_win_pct": "mean"
-    }).merge(
-        kr.groupby("player").agg({"pressure_return_win_pct": "mean"}),
-        on="player", how="outer"
+#%% Loading data
+
+def load_slam_data(
+    years: List[int],
+    slams: List[str],
+    verbose: bool = True
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """
+    Returns (matches_all, points_all, loaded_pairs)
+    loaded_pairs are slam-year pairs where BOTH matches and points loaded.
+    """
+    matches_list = []
+    points_list = []
+    loaded_pairs = []
+
+    for year in years:
+        for slam in slams:
+            matches_fname = f"{year}-{slam}-matches.csv"
+            points_fname = f"{year}-{slam}-points.csv"
+
+            ok_m, ok_p = False, False
+
+            try:
+                df_m = read_csv_cached(SLAM_BASE + matches_fname, matches_fname)
+                df_m["year"] = year
+                df_m["slam"] = slam
+                df_m["surface"] = SLAM_TO_SURFACE.get(slam, "Unknown")
+                matches_list.append(df_m)
+                ok_m = True
+                if verbose:
+                    print(f"Loaded matches: {matches_fname} shape={df_m.shape}")
+            except Exception as e:
+                if verbose:
+                    print(f"Skipping matches {matches_fname}: {e}")
+
+            try:
+                df_p = read_csv_cached(SLAM_BASE + points_fname, points_fname)
+                df_p["year"] = year
+                df_p["slam"] = slam
+                points_list.append(df_p)
+                ok_p = True
+                if verbose:
+                    print(f"Loaded points : {points_fname} shape={df_p.shape}")
+            except Exception as e:
+                if verbose:
+                    print(f"Skipping points {points_fname}: {e}")
+
+            if ok_m and ok_p:
+                loaded_pairs.append(f"{year}-{slam}")
+
+    if not matches_list or not points_list:
+        raise RuntimeError(
+            "No data loaded at all. Likely your year range has no files in the repo."
+        )
+
+    matches_all = pd.concat(matches_list, ignore_index=True)
+    points_all = pd.concat(points_list, ignore_index=True)
+
+    if verbose:
+        print("\nLoaded complete slam-year pairs:", loaded_pairs[:30], ("..." if len(loaded_pairs) > 30 else ""))
+        print("Total matches rows:", len(matches_all))
+        print("Total points rows :", len(points_all))
+
+    return matches_all, points_all, loaded_pairs
+
+
+#%% features
+
+def speed_to_bucket_kmh(v) -> str:
+    if pd.isna(v) or v == 0:
+        return "Unknown"
+    try:
+        v = float(v)
+    except Exception:
+        return "Unknown"
+    if v >= 195:
+        return "Fast"
+    if v >= 175:
+        return "Medium"
+    return "Slow"
+
+
+def score_to_bucket(score_str: str) -> str:
+    if pd.isna(score_str):
+        return "Unknown"
+    s = str(score_str).strip().upper()
+
+    if s in ["DEUCE", "40-40"]:
+        return "Deuce"
+
+    server_gp = {"40-0", "40-15", "40-30", "AD-40"}
+    returner_bp = {"0-40", "15-40", "30-40", "40-AD"}
+
+    if s in server_gp:
+        return "GamePointServer"
+    if s in returner_bp:
+        return "BreakPoint"
+
+    if s in {"0-0", "15-15", "30-30"}:
+        return "NeutralEven"
+    if s in {"15-0", "0-15", "30-15", "15-30"}:
+        return "NeutralOther"
+
+    return "Other"
+
+
+def build_server_score_str(row: pd.Series) -> str:
+    s1 = str(row.get("P1Score", "Unknown")).strip()
+    s2 = str(row.get("P2Score", "Unknown")).strip()
+    ps = row.get("PointServer", np.nan)
+
+    if ps == 1:
+        return f"{s1}-{s2}"
+    if ps == 2:
+        return f"{s2}-{s1}"
+    return "Unknown"
+
+
+def compute_point_won_server(row: pd.Series) -> float:
+    ps = row.get("PointServer", np.nan)
+    pw = row.get("PointWinner", np.nan)
+    if pd.isna(ps) or pd.isna(pw):
+        return np.nan
+    if pw in [1, 2] and ps in [1, 2]:
+        return 1.0 if pw == ps else 0.0
+    return np.nan
+
+
+#%% merging data
+
+def merge_points_matches(points_all: pd.DataFrame, matches_all: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robust merge:
+    - Forces match_id to string in both tables (prevents silent merge mismatch)
+    - Uses matches columns player1/player2 if available; else tries winner_name/loser_name
+    - Drops year/slam/surface from points before merge to avoid slam_x/slam_y
+    """
+    if "match_id" not in points_all.columns or "match_id" not in matches_all.columns:
+        raise ValueError("Missing match_id in points or matches.")
+
+    points_all = points_all.copy()
+    matches_all = matches_all.copy()
+
+    points_all["match_id"] = points_all["match_id"].astype(str)
+    matches_all["match_id"] = matches_all["match_id"].astype(str)
+
+    # Resolve matches schema
+    if "player1" in matches_all.columns and "player2" in matches_all.columns:
+        p1_col, p2_col = "player1", "player2"
+    elif "winner_name" in matches_all.columns and "loser_name" in matches_all.columns:
+        matches_all = matches_all.rename(columns={"winner_name": "player1", "loser_name": "player2"})
+        p1_col, p2_col = "player1", "player2"
+    else:
+        raise ValueError(
+            "Unknown matches schema. Expected player1/player2 or winner_name/loser_name. "
+            f"Matches columns sample: {list(matches_all.columns)[:40]}"
+        )
+
+    must_cols = ["match_id", p1_col, p2_col, "surface", "year", "slam"]
+    for c in must_cols:
+        if c not in matches_all.columns:
+            raise ValueError(f"matches_all missing required column: {c}")
+
+    matches_min = matches_all[must_cols].copy()
+
+    # Drop year/slam/surface from points to avoid duplicates on merge
+    drop_cols = [c for c in ["year", "slam", "surface"] if c in points_all.columns]
+    points_clean = points_all.drop(columns=drop_cols)
+
+    df = points_clean.merge(matches_min, on="match_id", how="left")
+
+    # If merge failed, player1/player2 will be mostly NaN
+    missing_players = df[p1_col].isna().mean()
+    if missing_players > 0.30:
+        raise RuntimeError(
+            "Merge looks wrong: too many missing player names after merge. "
+            "This is almost always match_id mismatch across points/matches files."
+        )
+
+    df = df.rename(columns={p1_col: "p1_name", p2_col: "p2_name"})
+
+    # Numeric server/winner
+    df["PointServer"] = pd.to_numeric(df.get("PointServer", np.nan), errors="coerce")
+    df["PointWinner"] = pd.to_numeric(df.get("PointWinner", np.nan), errors="coerce")
+    df = df[df["PointServer"].notna() & df["PointWinner"].notna()].copy()
+    df["PointServer"] = df["PointServer"].astype(int)
+    df["PointWinner"] = df["PointWinner"].astype(int)
+
+    df["server_name"] = np.where(df["PointServer"] == 1, df["p1_name"], df["p2_name"])
+    df["returner_name"] = np.where(df["PointServer"] == 1, df["p2_name"], df["p1_name"])
+
+    df["point_won"] = df.apply(compute_point_won_server, axis=1)
+    df = df.dropna(subset=["point_won"]).copy()
+    df["point_won"] = df["point_won"].astype(int)
+
+    # Serve speed
+    df["serve_speed_kmh"] = pd.to_numeric(df.get("Speed_KMH", np.nan), errors="coerce")
+    df["speed_bucket"] = df["serve_speed_kmh"].apply(speed_to_bucket_kmh)
+
+    # Serve number
+    if "ServeNumber" in df.columns:
+        df["serve_number"] = (
+            pd.to_numeric(df["ServeNumber"], errors="coerce")
+            .fillna(1)
+            .astype(int)
+        )
+    else:
+        df["serve_number"] = 1
+        
+    # Score
+    if "P1Score" not in df.columns:
+        df["P1Score"] = "Unknown"
+    if "P2Score" not in df.columns:
+        df["P2Score"] = "Unknown"
+
+    df["score_str_server"] = df.apply(build_server_score_str, axis=1)
+    df["score_bucket"] = df["score_str_server"].apply(score_to_bucket)
+
+    # Tiebreak (best effort)
+    if "TB" in df.columns:
+        df["is_tiebreak"] = (
+            pd.to_numeric(df["TB"], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
+    else:
+        df["is_tiebreak"] = 0
+
+    # Point index per match (for plotting)
+    df = df.sort_values(["match_id"]).copy()
+    df["point_index"] = df.groupby("match_id").cumcount() + 1
+
+    return df
+
+
+#%% expected point model
+
+def train_expected_point_model(df_points: pd.DataFrame) -> Pipeline:
+    """
+    Logistic model:
+      P(server wins point | surface, score_bucket, speed_bucket, serve_number)
+    """
+    feature_cols = ["surface", "score_bucket", "speed_bucket", "serve_number"]
+    X = df_points[feature_cols].copy()
+    y = df_points["point_won"].copy()
+
+    preprocess = ColumnTransformer(
+        transformers=[("cat", OneHotEncoder(handle_unknown="ignore"),
+                      ["surface", "score_bucket", "speed_bucket"])],
+        remainder="passthrough"
     )
 
-    player_features = serve_summary.merge(pressure_summary, on="player", how="outer")
-    player_features = player_features.dropna().reset_index(drop=True)
-
-    X_pf = player_features.drop(columns=["player"])
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_pf)
-
-    kmeans = KMeans(n_clusters=cfg.N_STYLE_CLUSTERS, random_state=42, n_init=10)
-    player_features["style_cluster"] = kmeans.fit_predict(X_scaled)
-
-    cluster_labels = {
-        0: "Big-Serve Aggressor",
-        1: "Baseline Grinder",
-        2: "All-Court Balanced",
-        3: "Counter-Puncher"
-    }
-    player_features["style_label"] = player_features["style_cluster"].map(cluster_labels).fillna("Unknown")
-
-    return dict(zip(player_features["player"], player_features["style_label"]))
-
-# %% 2) Load ATP matches from GitHub
-
-def load_atp_matches_github(cfg: Config) -> pd.DataFrame:
-    urls = [f"{ATP_BASE}atp_matches_{y}.csv" for y in range(cfg.START_YEAR, cfg.END_YEAR + 1)]
-
-    dfs = []
-    for url in urls:
-        try:
-            df = pd.read_csv(url, low_memory=False)
-            df["source_url"] = url
-            dfs.append(df)
-            print(f"Loaded: {url}  shape={df.shape}")
-        except Exception as e:
-            print(f"Skipping {url}: {e}")
-
-    if not dfs:
-        raise FileNotFoundError(
-            "No ATP match files could be loaded from GitHub.\n"
-            "Check internet access / proxy / SSL, or reduce year range."
-        )
-
-    matches = pd.concat(dfs, ignore_index=True)
-
-    matches["tourney_date"] = pd.to_datetime(matches["tourney_date"].astype(str), format="%Y%m%d", errors="coerce")
-    matches = matches.dropna(subset=["tourney_date"]).copy()
-
-    if "tourney_id" not in matches.columns or "match_num" not in matches.columns:
-        matches["match_uid"] = "synthetic_" + matches.index.astype(str)
-    else:
-        matches["match_uid"] = matches["tourney_id"].astype(str) + "_" + matches["match_num"].astype(str)
-
-    needed = ["w_bpFaced", "w_bpSaved", "l_bpFaced", "l_bpSaved"]
-    missing = [c for c in needed if c not in matches.columns]
-    if missing:
-        raise ValueError(f"Missing required BP columns in loaded data: {missing}")
-
-    for c in needed:
-        matches[c] = pd.to_numeric(matches[c], errors="coerce")
-
-    if cfg.DROP_MISSING_BP_STATS:
-        matches = matches.dropna(subset=needed).copy()
-    else:
-        matches[needed] = matches[needed].fillna(0)
-
-    for c in needed:
-        matches = matches[matches[c] >= 0]
-
-    matches = matches.sort_values(["tourney_date", "match_uid"]).reset_index(drop=True)
-    return matches
-
-# %% 3) Player match table
-
-def derive_player_match_rows(matches: pd.DataFrame) -> pd.DataFrame:
-    w = pd.DataFrame({
-        "match_uid": matches["match_uid"],
-        "date": matches["tourney_date"],
-        "surface": matches.get("surface", np.nan),
-        "tourney_level": matches.get("tourney_level", np.nan),
-        "round": matches.get("round", np.nan),
-        "best_of": matches.get("best_of", np.nan),
-
-        "player_name": matches["winner_name"],
-        "opponent_name": matches["loser_name"],
-
-        "player_rank": matches.get("winner_rank", np.nan),
-        "opponent_rank": matches.get("loser_rank", np.nan),
-        "player_rank_points": matches.get("winner_rank_points", np.nan),
-        "opponent_rank_points": matches.get("loser_rank_points", np.nan),
-
-        "player_hand": matches.get("winner_hand", np.nan),
-        "opponent_hand": matches.get("loser_hand", np.nan),
-
-        "bp_created": matches["l_bpFaced"],
-        "bp_converted": (matches["l_bpFaced"] - matches["l_bpSaved"]).clip(lower=0),
-        "bp_faced": matches["w_bpFaced"],
-        "bp_saved": matches["w_bpSaved"],
-
-        "won_match": 1
-    })
-
-    l = pd.DataFrame({
-        "match_uid": matches["match_uid"],
-        "date": matches["tourney_date"],
-        "surface": matches.get("surface", np.nan),
-        "tourney_level": matches.get("tourney_level", np.nan),
-        "round": matches.get("round", np.nan),
-        "best_of": matches.get("best_of", np.nan),
-
-        "player_name": matches["loser_name"],
-        "opponent_name": matches["winner_name"],
-
-        "player_rank": matches.get("loser_rank", np.nan),
-        "opponent_rank": matches.get("winner_rank", np.nan),
-        "player_rank_points": matches.get("loser_rank_points", np.nan),
-        "opponent_rank_points": matches.get("winner_rank_points", np.nan),
-
-        "player_hand": matches.get("loser_hand", np.nan),
-        "opponent_hand": matches.get("winner_hand", np.nan),
-
-        "bp_created": matches["w_bpFaced"],
-        "bp_converted": (matches["w_bpFaced"] - matches["w_bpSaved"]).clip(lower=0),
-        "bp_faced": matches["l_bpFaced"],
-        "bp_saved": matches["l_bpSaved"],
-
-        "won_match": 0
-    })
-
-    pm = pd.concat([w, l], ignore_index=True)
-    pm = pm.sort_values(["date", "match_uid", "player_name"]).reset_index(drop=True)
-
-    pm["rank_diff"] = pm["player_rank"] - pm["opponent_rank"]
-    pm["rp_diff"] = pm["player_rank_points"] - pm["opponent_rank_points"]
-    pm["bp_conv_rate"] = np.where(pm["bp_created"] > 0, pm["bp_converted"] / pm["bp_created"], np.nan)
-    pm["bp_save_rate"] = np.where(pm["bp_faced"] > 0, pm["bp_saved"] / pm["bp_faced"], np.nan)
-
-    return pm
-
-# %% 4) Rolling features
-
-def add_rolling_features(pm: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    pm = pm.copy()
-    w = cfg.ROLLING_WINDOW
-    m = max(3, cfg.MIN_HISTORY_MATCHES)
-
-    def _roll(g: pd.DataFrame) -> pd.DataFrame:
-        g = g.sort_values(["date", "match_uid"]).copy()
-
-        for col in ["bp_created", "bp_converted", "bp_faced", "bp_saved"]:
-            g[f"r_{col}_mean"] = g[col].shift(1).rolling(w, min_periods=m).mean()
-            g[f"r_{col}_sum"]  = g[col].shift(1).rolling(w, min_periods=m).sum()
-
-        g["r_bp_conv_rate"] = np.where(
-            g["r_bp_created_sum"] > 0,
-            g["r_bp_converted_sum"] / g["r_bp_created_sum"],
-            np.nan
-        )
-        g["r_bp_save_rate"] = np.where(
-            g["r_bp_faced_sum"] > 0,
-            g["r_bp_saved_sum"] / g["r_bp_faced_sum"],
-            np.nan
-        )
-
-        g["r_win_rate"] = g["won_match"].shift(1).rolling(w, min_periods=m).mean()
-        g["r_matches_played"] = g["won_match"].shift(1).rolling(w, min_periods=m).count()
-        return g
-
-    pm = pm.groupby("player_name", group_keys=False).apply(_roll)
-
-    pm = pm[pm["r_matches_played"].notna()].copy()
-    pm = pm[pm["r_matches_played"] >= cfg.MIN_HISTORY_MATCHES].copy()
-
-    opp_cols = [
-        "match_uid", "player_name",
-        "r_bp_created_mean", "r_bp_converted_mean", "r_bp_faced_mean", "r_bp_saved_mean",
-        "r_bp_conv_rate", "r_bp_save_rate", "r_win_rate", "r_matches_played",
-        "player_rank", "player_rank_points"
-    ]
-
-    opp = pm[opp_cols].copy()
-    opp = opp.rename(columns={"player_name": "opponent_name"})
-    opp = opp.rename(columns={c: f"opp_{c}" for c in opp.columns if c not in ["match_uid", "opponent_name"]})
-
-    pm = pm.merge(opp, on=["match_uid", "opponent_name"], how="left", validate="m:1")
-    return pm
-
-# %% 5) Style features
-
-def add_style_features(pm: pd.DataFrame, style_map: Dict[str, str]) -> pd.DataFrame:
-    pm = pm.copy()
-    pm["player_type"] = pm["player_name"].map(style_map).fillna("Unknown")
-    pm["opponent_type"] = pm["opponent_name"].map(style_map).fillna("Unknown")
-    return pm
-
-# %% 6) Model training
-
-def build_feature_lists(pm: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    numeric_cols = [
-        "player_rank", "opponent_rank", "rank_diff",
-        "player_rank_points", "opponent_rank_points", "rp_diff",
-        "best_of",
-
-        "r_bp_created_mean", "r_bp_converted_mean", "r_bp_faced_mean", "r_bp_saved_mean",
-        "r_bp_conv_rate", "r_bp_save_rate", "r_win_rate", "r_matches_played",
-
-        "opp_r_bp_created_mean", "opp_r_bp_converted_mean", "opp_r_bp_faced_mean", "opp_r_bp_saved_mean",
-        "opp_r_bp_conv_rate", "opp_r_bp_save_rate", "opp_r_win_rate", "opp_r_matches_played",
-        "opp_player_rank", "opp_player_rank_points"
-    ]
-    numeric_cols = [c for c in numeric_cols if c in pm.columns]
-
-    categorical_cols = [
-        "surface", "tourney_level", "round",
-        "player_hand", "opponent_hand",
-        "player_type", "opponent_type"
-    ]
-    categorical_cols = [c for c in categorical_cols if c in pm.columns]
-
-    return numeric_cols, categorical_cols
-
-
-def make_preprocessor(numeric_cols: List[str], categorical_cols: List[str]) -> ColumnTransformer:
-    num_tf = Pipeline([("imputer", SimpleImputer(strategy="median"))])
-    cat_tf = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    model = Pipeline(steps=[
+        ("preprocess", preprocess),
+        ("clf", LogisticRegression(max_iter=500))
     ])
-    return ColumnTransformer(
-        transformers=[("num", num_tf, numeric_cols), ("cat", cat_tf, categorical_cols)],
-        remainder="drop"
+
+    if len(df_points) < 2000:
+        model.fit(X, y)
+        print("Expected-point model trained on full data (small dataset).")
+        return model
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    print(f"Expected model accuracy: {accuracy_score(y_test, y_pred):.3f}")
+    print(f"Expected model AUC     : {roc_auc_score(y_test, y_proba):.3f}")
+    return model
+
+
+#%% momentum engine
+
+def leverage_weight(score_bucket: str, is_tiebreak: int) -> float:
+    if is_tiebreak == 1:
+        return LEVERAGE_TB
+    if score_bucket == "BreakPoint":
+        return LEVERAGE_BREAKPOINT
+    if score_bucket == "GamePointServer":
+        return LEVERAGE_GAMEPOINT
+    if score_bucket == "Deuce":
+        return LEVERAGE_DEUCE
+    return LEVERAGE_DEFAULT
+
+
+def momentum_phase_label(m: float) -> str:
+    if m >= PHASE_POS_DOMINANT:
+        return "Dominant (Positive)"
+    if m >= PHASE_POS_EDGE:
+        return "Edge (Positive)"
+    if m <= PHASE_NEG_DOMINANT:
+        return "Dominant (Negative)"
+    if m <= PHASE_NEG_EDGE:
+        return "Edge (Negative)"
+    return "Neutral"
+
+
+def mental_prep_cue(phase: str, just_lost_big: bool, just_won_big: bool) -> str:
+    if just_lost_big:
+        return "RESET: slow exhale → long target → commit to first 2 shots."
+    if just_won_big:
+        return "STAY: same routine, same tempo. Don’t rush the next point."
+
+    if phase == "Dominant (Positive)":
+        return "PRESS: repeat best pattern, keep margins, protect routine."
+    if phase == "Edge (Positive)":
+        return "BUILD: high 1st-serve %, heavy cross, avoid low-% lines."
+    if phase == "Dominant (Negative)":
+        return "STOP BLEED: simplify (body serve / deep return), one clear intention."
+    if phase == "Edge (Negative)":
+        return "STABILIZE: bigger targets, reset between points, play to neutral."
+    return "NEUTRAL: routine + clarity. Pick one pattern and execute fully."
+
+
+def compute_momentum_for_match(df_match: pd.DataFrame, expected_model: Pipeline, focus_player: str) -> pd.DataFrame:
+    """
+    Compute momentum time series for ONE match from focus player's perspective.
+    """
+    df = df_match.copy()
+
+    # Predict expected probability (server wins point)
+    feat = df[["surface", "score_bucket", "speed_bucket", "serve_number"]].copy()
+    df["p_server_win_exp"] = expected_model.predict_proba(feat)[:, 1]
+
+    # Focus perspective
+    df["focus_is_server"] = (df["server_name"].astype(str).str.lower() == str(focus_player).strip().lower()).astype(int)
+
+    df["focus_actual_win"] = np.where(df["focus_is_server"] == 1, df["point_won"], 1 - df["point_won"])
+    df["focus_exp_win"] = np.where(df["focus_is_server"] == 1, df["p_server_win_exp"], 1 - df["p_server_win_exp"])
+
+    # Leverage + pred error
+    df["leverage"] = [
+        leverage_weight(sb, tb) for sb, tb in zip(df["score_bucket"], df["is_tiebreak"])
+    ]
+    df["surprise"] = (df["focus_actual_win"] - df["focus_exp_win"]).astype(float)
+    df["swing_value"] = MOMENTUM_SCALE * df["leverage"] * df["surprise"]
+
+    # Momentum recursion
+    m = 0.0
+    series = []
+    for v in df["swing_value"].values:
+        m = MOMENTUM_DECAY * m + float(v)
+        m = max(-CLIP_MOMENTUM, min(CLIP_MOMENTUM, m))
+        series.append(m)
+
+    df["momentum_index"] = series
+    df["momentum_phase"] = df["momentum_index"].apply(momentum_phase_label)
+
+    # Big swings (tune)
+    df["just_won_big"] = (df["swing_value"] >= 2.5).astype(int)
+    df["just_lost_big"] = (df["swing_value"] <= -2.5).astype(int)
+
+    df["mental_cue"] = [
+        mental_prep_cue(ph, bool(jl), bool(jw))
+        for ph, jl, jw in zip(df["momentum_phase"], df["just_lost_big"], df["just_won_big"])
+    ]
+
+    return df
+
+
+#%% filtering 
+
+def list_players(df_points: pd.DataFrame) -> np.ndarray:
+    return pd.unique(pd.concat([df_points["p1_name"], df_points["p2_name"]], ignore_index=True))
+
+def find_player_candidates(df_points: pd.DataFrame, needle: str, top: int = 30) -> List[str]:
+    n = str(needle).strip().lower()
+    players = list_players(df_points)
+    hits = [p for p in players if n in str(p).lower()]
+    return [str(x) for x in hits[:top]]
+
+def opponent_type_simple(opponent_name: str) -> str:
+    """
+    Placeholder opponent type bucket (replace with your MCP/KMeans style map later).
+    """
+    if not isinstance(opponent_name, str) or opponent_name.strip() == "":
+        return "Unknown"
+
+    big_servers = {"John Isner", "Reilly Opelka", "Ivo Karlovic"}
+    grinders = {"Rafael Nadal", "David Ferrer", "Diego Schwartzman"}
+    all_court = {"Roger Federer", "Stefanos Tsitsipas", "Grigor Dimitrov"}
+
+    if opponent_name in big_servers:
+        return "Big Server"
+    if opponent_name in grinders:
+        return "Grinder"
+    if opponent_name in all_court:
+        return "All-Court"
+    return "Unknown"
+
+
+#%% power bi tables
+
+def build_momentum_tables(
+    df_points: pd.DataFrame,
+    expected_model: Pipeline,
+    focus_player_filter: str,
+    surface_filter: Optional[str] = None,
+    opponent_filter: Optional[str] = None,
+    opponent_type_filter: Optional[str] = None,
+    max_matches_after_filter: Optional[int] = 200
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      momentum_points_long: one row per point per match per focus player
+      momentum_match_summary: one row per match per focus player
+    """
+
+    # Build match frame for filtering first
+    match_frame = (
+        df_points.groupby("match_id", as_index=False)
+        .agg(
+            p1_name=("p1_name", "first"),
+            p2_name=("p2_name", "first"),
+            surface=("surface", "first"),
+            year=("year", "first"),
+            slam=("slam", "first"),
+        )
     )
 
+    # Apply surface filter
+    if surface_filter is not None:
+        match_frame = match_frame[
+            match_frame["surface"].astype(str).str.lower() == str(surface_filter).strip().lower()
+        ]
 
-def expand_binomial_rows(
-    df: pd.DataFrame,
-    feature_cols: List[str],
-    trials_col: str,
-    succ_col: str,
-    cap: int,
-    seed: int
-) -> Tuple[pd.DataFrame, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    X_rows, y_rows = [], []
+    # Focus player (substring match)
+    fp = str(focus_player_filter).strip().lower()
+    match_frame_fp = match_frame[
+        match_frame["p1_name"].astype(str).str.lower().str.contains(fp, na=False) |
+        match_frame["p2_name"].astype(str).str.lower().str.contains(fp, na=False)
+    ].copy()
 
-    for i in range(len(df)):
-        t = df.iloc[i][trials_col]
-        s = df.iloc[i][succ_col]
-        if pd.isna(t) or t <= 0:
+    if match_frame_fp.empty:
+        print("\n[DIAGNOSTIC] No matches contain focus player filter:", focus_player_filter)
+        cands = find_player_candidates(df_points, focus_player_filter)
+        print("[DIAGNOSTIC] Candidate players containing that string:", cands[:20])
+        print("[DIAGNOSTIC] Years in current merged dataset:",
+              sorted(df_points["year"].dropna().unique())[:10], "...",
+              sorted(df_points["year"].dropna().unique())[-10:])
+        # Hard fail here (this means player truly not in loaded years)
+        raise RuntimeError(
+            "Focus player not found in the currently loaded year range. "
+            "Load later years (e.g., 2020–2024) or broaden the year list."
+        )
+
+    # Apply max_matches AFTER filtering
+    if max_matches_after_filter is not None:
+        match_frame_fp = match_frame_fp.head(max_matches_after_filter)
+
+    match_ids = match_frame_fp["match_id"].astype(str).tolist()
+
+    # Build momentum
+    momentum_rows = []
+    for mid in match_ids:
+        dfm = df_points[df_points["match_id"].astype(str) == str(mid)].copy()
+        if dfm.empty:
             continue
 
-        t = int(t)
-        s = int(s)
-        p = (s / t) if t > 0 else 0.0
-
-        if t > cap:
-            yi = rng.binomial(1, p, size=cap)
-            reps = cap
+        # Determine actual focus player name in this match
+        p1 = str(dfm["p1_name"].iloc[0])
+        p2 = str(dfm["p2_name"].iloc[0])
+        if fp in p1.lower():
+            focus_player = p1
+            opponent = p2
         else:
-            yi = np.array([1] * s + [0] * (t - s), dtype=int)
-            rng.shuffle(yi)
-            reps = t
+            focus_player = p2
+            opponent = p1
 
-        Xi = pd.concat([df.iloc[[i]][feature_cols]] * reps, ignore_index=True)
-        X_rows.append(Xi)
-        y_rows.append(yi)
+        opp_type = opponent_type_simple(opponent)
 
-    if not X_rows:
-        raise RuntimeError("Binomial expansion produced no rows (no trials).")
+        # Opponent filters
+        if opponent_filter is not None:
+            if str(opponent_filter).strip().lower() not in opponent.lower():
+                continue
+        if opponent_type_filter is not None:
+            if str(opponent_type_filter).strip().lower() != str(opp_type).strip().lower():
+                continue
 
-    return pd.concat(X_rows, ignore_index=True), np.concatenate(y_rows)
+        df_focus = compute_momentum_for_match(dfm.sort_values("point_index"), expected_model, focus_player)
 
+        df_focus["focus_player"] = focus_player
+        df_focus["opponent"] = opponent
+        df_focus["opponent_type"] = opp_type
 
-@dataclass
-class TrainedBPModels:
-    numeric_cols: List[str]
-    categorical_cols: List[str]
-    model_created: Pipeline
-    model_faced: Pipeline
-    model_conv_prob: Pipeline
-    model_save_prob: Pipeline
+        keep_cols = [
+            "match_id", "year", "slam", "surface",
+            "focus_player", "opponent", "opponent_type",
+            "point_index",
+            "server_name", "returner_name", "focus_is_server",
+            "score_str_server", "score_bucket",
+            "serve_number", "speed_bucket", "serve_speed_kmh",
+            "focus_actual_win", "focus_exp_win",
+            "leverage", "surprise", "swing_value",
+            "momentum_index", "momentum_phase",
+            "just_won_big", "just_lost_big",
+            "mental_cue"
+        ]
+        momentum_rows.append(df_focus[keep_cols].copy())
 
+    if not momentum_rows:
+        # Provide precise diagnostic rather than generic message
+        raise RuntimeError(
+            "Matches found for player, but none survived opponent/surface/type filters. "
+            "Set opponent_filter=None and opponent_type_filter=None and/or surface_filter=None."
+        )
 
-def train_bp_models(pm: pd.DataFrame, cfg: Config) -> TrainedBPModels:
-    num_cols, cat_cols = build_feature_lists(pm)
-    feat_cols = num_cols + cat_cols
-    pre = make_preprocessor(num_cols, cat_cols)
+    momentum_points_long = pd.concat(momentum_rows, ignore_index=True)
 
-    X = pm[feat_cols].copy()
-    y_created = pm["bp_created"].astype(float).values
-    y_faced   = pm["bp_faced"].astype(float).values
+    summary = (momentum_points_long
+               .groupby(["match_id", "year", "slam", "surface", "focus_player", "opponent", "opponent_type"])
+               .agg(
+                   n_points=("point_index", "count"),
+                   win_rate=("focus_actual_win", "mean"),
+                   momentum_mean=("momentum_index", "mean"),
+                   momentum_std=("momentum_index", "std"),
+                   momentum_end=("momentum_index", "last"),
+                   big_wins=("just_won_big", "sum"),
+                   big_losses=("just_lost_big", "sum")
+               )
+               .reset_index())
 
-    model_created = Pipeline([("pre", pre), ("reg", PoissonRegressor(alpha=1.0, max_iter=2000))])
-    model_faced   = Pipeline([("pre", pre), ("reg", PoissonRegressor(alpha=1.0, max_iter=2000))])
-
-    base = pm[feat_cols + ["bp_created", "bp_converted", "bp_faced", "bp_saved"]].copy()
-
-    X_conv_exp, y_conv_exp = expand_binomial_rows(
-        base, feat_cols, "bp_created", "bp_converted", cfg.BINOMIAL_EXPAND_CAP, seed=7
-    )
-    X_save_exp, y_save_exp = expand_binomial_rows(
-        base, feat_cols, "bp_faced", "bp_saved", cfg.BINOMIAL_EXPAND_CAP, seed=11
-    )
-
-    model_conv_prob = Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=2000, solver="lbfgs"))])
-    model_save_prob = Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=2000, solver="lbfgs"))])
-
-    model_created.fit(X, y_created)
-    model_faced.fit(X, y_faced)
-    model_conv_prob.fit(X_conv_exp, y_conv_exp)
-    model_save_prob.fit(X_save_exp, y_save_exp)
-
-    return TrainedBPModels(
-        numeric_cols=num_cols,
-        categorical_cols=cat_cols,
-        model_created=model_created,
-        model_faced=model_faced,
-        model_conv_prob=model_conv_prob,
-        model_save_prob=model_save_prob
-    )
-
-# %% 7) Model evaluation
-
-def quick_eval_counts(pm: pd.DataFrame, models: TrainedBPModels, n_splits: int = 5) -> Dict[str, float]:
-    X = pm[models.numeric_cols + models.categorical_cols].copy()
-    y_created = pm["bp_created"].astype(float).values
-    y_faced = pm["bp_faced"].astype(float).values
-
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    maes_c, maes_f = [], []
-
-    for tr, te in tscv.split(X):
-        pre = make_preprocessor(models.numeric_cols, models.categorical_cols)
-        mc = Pipeline([("pre", pre), ("reg", PoissonRegressor(alpha=1.0, max_iter=2000))])
-        mf = Pipeline([("pre", pre), ("reg", PoissonRegressor(alpha=1.0, max_iter=2000))])
-
-        mc.fit(X.iloc[tr], y_created[tr])
-        mf.fit(X.iloc[tr], y_faced[tr])
-
-        maes_c.append(mean_absolute_error(y_created[te], mc.predict(X.iloc[te])))
-        maes_f.append(mean_absolute_error(y_faced[te], mf.predict(X.iloc[te])))
-
-    return {"MAE_bp_created": float(np.mean(maes_c)), "MAE_bp_faced": float(np.mean(maes_f))}
+    return momentum_points_long, summary
 
 
-# %% 8) forecasting layer
+#%% exports and plotting
 
-def get_latest_context_row(pm: pd.DataFrame, player: str) -> pd.Series:
-    dfp = pm[pm["player_name"] == player].copy()
-    if dfp.empty:
-        raise ValueError(f"No usable history for player '{player}'. Lower MIN_HISTORY_MATCHES or expand years.")
-    return dfp.sort_values(["date", "match_uid"]).iloc[-1]
+def export_for_power_bi(points_long: pd.DataFrame, summary: pd.DataFrame) -> Tuple[str, str]:
+    p1 = os.path.join(EXPORT_DIR, "momentum_points_long.csv")
+    p2 = os.path.join(EXPORT_DIR, "momentum_match_summary.csv")
+    points_long.to_csv(p1, index=False, encoding="utf-8")
+    summary.to_csv(p2, index=False, encoding="utf-8")
+    print(f"\nSaved → {p1}")
+    print(f"Saved → {p2}")
+    return p1, p2
 
 
-def build_synthetic_opponent_profile(pm: pd.DataFrame, filters: Dict[str, Any]) -> Dict[str, Any]:
-    df = pm.copy()
-
-    if "surface" in filters and "surface" in df.columns:
-        df = df[df["surface"] == filters["surface"]]
-    if "opponent_type" in filters and "opponent_type" in df.columns:
-        df = df[df["opponent_type"] == filters["opponent_type"]]
-    if "opponent_rank_max" in filters:
-        df = df[pd.to_numeric(df["opponent_rank"], errors="coerce") <= float(filters["opponent_rank_max"])]
-    if "opponent_rank_min" in filters:
-        df = df[pd.to_numeric(df["opponent_rank"], errors="coerce") >= float(filters["opponent_rank_min"])]
+def plot_match_momentum(points_long: pd.DataFrame, match_id: str, focus_player: str) -> None:
+    df = points_long[
+        (points_long["match_id"].astype(str) == str(match_id)) &
+        (points_long["focus_player"].astype(str).str.lower() == str(focus_player).strip().lower())
+    ].copy()
 
     if df.empty:
-        raise ValueError("Opponent-type filters returned no rows. Loosen filters or expand years.")
-
-    prof: Dict[str, Any] = {}
-    num_fields = [
-        "opponent_rank", "opponent_rank_points",
-        "opp_r_bp_created_mean", "opp_r_bp_converted_mean", "opp_r_bp_faced_mean", "opp_r_bp_saved_mean",
-        "opp_r_bp_conv_rate", "opp_r_bp_save_rate", "opp_r_win_rate", "opp_r_matches_played",
-        "opp_player_rank", "opp_player_rank_points"
-    ]
-    for f in num_fields:
-        if f in df.columns:
-            prof[f] = float(pd.to_numeric(df[f], errors="coerce").median())
-
-    for f in ["opponent_hand", "opponent_type"]:
-        if f in df.columns:
-            mode = df[f].mode(dropna=True)
-            prof[f] = mode.iloc[0] if not mode.empty else "Unknown"
-
-    return prof
-
-
-def build_forecast_row(
-    pm: pd.DataFrame,
-    player: str,
-    opponent: Optional[str] = None,
-    surface: Optional[str] = None,
-    tourney_level: Optional[str] = None,
-    best_of: int = 3,
-    round_name: Optional[str] = None,
-    opponent_type_filters: Optional[Dict[str, Any]] = None
-) -> pd.DataFrame:
-    p = get_latest_context_row(pm, player)
-
-    row: Dict[str, Any] = {
-        "surface": surface if surface is not None else p.get("surface", "Unknown"),
-        "tourney_level": tourney_level if tourney_level is not None else p.get("tourney_level", "Unknown"),
-        "round": round_name if round_name is not None else p.get("round", "Unknown"),
-        "best_of": best_of,
-
-        "player_rank": p.get("player_rank", np.nan),
-        "player_rank_points": p.get("player_rank_points", np.nan),
-        "player_hand": p.get("player_hand", "Unknown"),
-        "player_type": p.get("player_type", "Unknown"),
-
-        "r_bp_created_mean": p.get("r_bp_created_mean", np.nan),
-        "r_bp_converted_mean": p.get("r_bp_converted_mean", np.nan),
-        "r_bp_faced_mean": p.get("r_bp_faced_mean", np.nan),
-        "r_bp_saved_mean": p.get("r_bp_saved_mean", np.nan),
-        "r_bp_conv_rate": p.get("r_bp_conv_rate", np.nan),
-        "r_bp_save_rate": p.get("r_bp_save_rate", np.nan),
-        "r_win_rate": p.get("r_win_rate", np.nan),
-        "r_matches_played": p.get("r_matches_played", np.nan),
-    }
-
-    if opponent is not None:
-        o = get_latest_context_row(pm, opponent)
-
-        row["opponent_rank"] = o.get("player_rank", np.nan)
-        row["opponent_rank_points"] = o.get("player_rank_points", np.nan)
-        row["opponent_hand"] = o.get("player_hand", "Unknown")
-        row["opponent_type"] = o.get("player_type", "Unknown")
-
-        row["opp_r_bp_created_mean"] = o.get("r_bp_created_mean", np.nan)
-        row["opp_r_bp_converted_mean"] = o.get("r_bp_converted_mean", np.nan)
-        row["opp_r_bp_faced_mean"] = o.get("r_bp_faced_mean", np.nan)
-        row["opp_r_bp_saved_mean"] = o.get("r_bp_saved_mean", np.nan)
-        row["opp_r_bp_conv_rate"] = o.get("r_bp_conv_rate", np.nan)
-        row["opp_r_bp_save_rate"] = o.get("r_bp_save_rate", np.nan)
-        row["opp_r_win_rate"] = o.get("r_win_rate", np.nan)
-        row["opp_r_matches_played"] = o.get("r_matches_played", np.nan)
-
-        row["opp_player_rank"] = o.get("player_rank", np.nan)
-        row["opp_player_rank_points"] = o.get("player_rank_points", np.nan)
-
-    else:
-        if opponent_type_filters is None:
-            opponent_type_filters = {"surface": row["surface"], "opponent_rank_min": 1, "opponent_rank_max": 200}
-
-        prof = build_synthetic_opponent_profile(pm, opponent_type_filters)
-
-        row["opponent_rank"] = prof.get("opponent_rank", np.nan)
-        row["opponent_rank_points"] = prof.get("opponent_rank_points", np.nan)
-        row["opponent_hand"] = prof.get("opponent_hand", "Unknown")
-        row["opponent_type"] = prof.get("opponent_type", "Unknown")
-
-        row["opp_r_bp_created_mean"] = prof.get("opp_r_bp_created_mean", np.nan)
-        row["opp_r_bp_converted_mean"] = prof.get("opp_r_bp_converted_mean", np.nan)
-        row["opp_r_bp_faced_mean"] = prof.get("opp_r_bp_faced_mean", np.nan)
-        row["opp_r_bp_saved_mean"] = prof.get("opp_r_bp_saved_mean", np.nan)
-        row["opp_r_bp_conv_rate"] = prof.get("opp_r_bp_conv_rate", np.nan)
-        row["opp_r_bp_save_rate"] = prof.get("opp_r_bp_save_rate", np.nan)
-        row["opp_r_win_rate"] = prof.get("opp_r_win_rate", np.nan)
-        row["opp_r_matches_played"] = prof.get("opp_r_matches_played", np.nan)
-
-        row["opp_player_rank"] = prof.get("opp_player_rank", np.nan)
-        row["opp_player_rank_points"] = prof.get("opp_player_rank_points", np.nan)
-
-    row["rank_diff"] = row["player_rank"] - row["opponent_rank"] if pd.notna(row["player_rank"]) and pd.notna(row["opponent_rank"]) else np.nan
-    row["rp_diff"] = row["player_rank_points"] - row["opponent_rank_points"] if pd.notna(row["player_rank_points"]) and pd.notna(row["opponent_rank_points"]) else np.nan
-
-    return pd.DataFrame([row])
-
-
-def align_features_for_prediction(X_one: pd.DataFrame, models: TrainedBPModels) -> pd.DataFrame:
-    expected = models.numeric_cols + models.categorical_cols
-    X_one = X_one.copy()
-    for c in expected:
-        if c not in X_one.columns:
-            X_one[c] = np.nan
-    X_one = X_one[expected].copy()
-    return X_one
-
-
-def forecast_break_points(models: TrainedBPModels, X_one: pd.DataFrame) -> Dict[str, float]:
-    created = float(models.model_created.predict(X_one)[0])
-    faced = float(models.model_faced.predict(X_one)[0])
-
-    p_conv = float(models.model_conv_prob.predict_proba(X_one)[0, 1])
-    p_save = float(models.model_save_prob.predict_proba(X_one)[0, 1])
-
-    created = max(0.0, created)
-    faced = max(0.0, faced)
-    p_conv = float(np.clip(p_conv, 0.0, 1.0))
-    p_save = float(np.clip(p_save, 0.0, 1.0))
-
-    return {
-        "bp_created_exp": created,
-        "bp_converted_exp": created * p_conv,
-        "bp_faced_exp": faced,
-        "bp_saved_exp": faced * p_save,
-        "bp_conv_prob": p_conv,
-        "bp_save_prob": p_save
-    }
-
-
-def print_bp_forecast(player: str, opponent_label: str, surface: str, out: Dict[str, float]):
-    print("\n" + "=" * 72)
-    print(f"BREAK-POINT FORECAST — {player} vs {opponent_label}  (Surface={surface})")
-    print("=" * 72)
-    print(f"BP Created (exp)   : {out['bp_created_exp']:.2f}")
-    print(f"BP Converted (exp) : {out['bp_converted_exp']:.2f}   | Conversion% ≈ {out['bp_conv_prob']:.1%}")
-    print("-" * 72)
-    print(f"BP Faced (exp)     : {out['bp_faced_exp']:.2f}")
-    print(f"BP Saved (exp)     : {out['bp_saved_exp']:.2f}   | Save% ≈ {out['bp_save_prob']:.1%}")
-    print("=" * 72 + "\n")
-
-
-# %% 9) Exports for PowerBI
-
-def get_output_dir() -> Path:
-    try:
-        base = Path(__file__).resolve().parent
-    except NameError:
-        base = Path.cwd()
-    out_dir = base / OUT_DIR_NAME
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
-
-
-def build_predictions_table(models: TrainedBPModels, pm: pd.DataFrame) -> pd.DataFrame:
-    """
-    Power BI fact table. Add more scenarios as necessary.
-    """
-    scenarios = [
-        {
-            "scenario_id": "SINNER_vs_DJOKOVIC_HARD_SF",
-            "player": "Jannik Sinner",
-            "opponent": "Novak Djokovic",
-            "surface": "Hard",
-            "tourney_level": "M",
-            "best_of": 3,
-            "round_name": "SF",
-            "opp_type_filters": None
-        },
-        {
-            "scenario_id": "SINNER_vs_TOP30_BASELINEGRINDER_HARD_QF",
-            "player": "Jannik Sinner",
-            "opponent": None,
-            "surface": "Hard",
-            "tourney_level": "A",
-            "best_of": 3,
-            "round_name": "QF",
-            "opp_type_filters": {
-                "surface": "Hard",
-                "opponent_type": "Baseline Grinder",
-                "opponent_rank_min": 1,
-                "opponent_rank_max": 30
-            }
-        }
-    ]
-
-    rows = []
-    for sc in scenarios:
-        X = build_forecast_row(
-            pm=pm,
-            player=sc["player"],
-            opponent=sc["opponent"],
-            surface=sc["surface"],
-            tourney_level=sc["tourney_level"],
-            best_of=sc["best_of"],
-            round_name=sc["round_name"],
-            opponent_type_filters=sc["opp_type_filters"]
-        )
-        X = align_features_for_prediction(X, models)
-        out = forecast_break_points(models, X)
-
-        rows.append({
-            "scenario_id": sc["scenario_id"],
-            "player_name": sc["player"],
-            "opponent_name": sc["opponent"] if sc["opponent"] is not None else "OPPONENT_TYPE",
-            "surface": sc["surface"],
-            "tourney_level": sc["tourney_level"],
-            "round": sc["round_name"],
-            "best_of": sc["best_of"],
-            "bp_created_exp": out["bp_created_exp"],
-            "bp_converted_exp": out["bp_converted_exp"],
-            "bp_faced_exp": out["bp_faced_exp"],
-            "bp_saved_exp": out["bp_saved_exp"],
-            "bp_conv_prob": out["bp_conv_prob"],
-            "bp_save_prob": out["bp_save_prob"],
-        })
-
-    return pd.DataFrame(rows)
-
-
-def build_feature_schema_table(models: TrainedBPModels) -> pd.DataFrame:
-    return pd.DataFrame({
-        "feature_name": models.numeric_cols + models.categorical_cols,
-        "feature_type": (["numeric"] * len(models.numeric_cols)) + (["categorical"] * len(models.categorical_cols))
-    })
-
-
-def build_player_styles_table(style_map: Dict[str, str]) -> pd.DataFrame:
-    return pd.DataFrame({
-        "player_name": list(style_map.keys()),
-        "player_type": list(style_map.values())
-    }).drop_duplicates()
-
-
-def build_latest_snapshot(pm: pd.DataFrame) -> pd.DataFrame:
-    """
-    Latest rolling features per player (for Power BI player cards).
-    """
-    snap = (pm.sort_values(["date", "match_uid"])
-              .groupby("player_name", as_index=False)
-              .tail(1)
-              .copy())
-    keep_cols = [
-        "player_name", "date", "surface",
-        "player_type",
-        "player_rank", "player_rank_points",
-        "r_bp_created_mean", "r_bp_converted_mean", "r_bp_faced_mean", "r_bp_saved_mean",
-        "r_bp_conv_rate", "r_bp_save_rate", "r_win_rate", "r_matches_played"
-    ]
-    keep_cols = [c for c in keep_cols if c in snap.columns]
-    return snap[keep_cols].reset_index(drop=True)
-
-
-def export_powerbi_tables(style_map: Dict[str, str], pm: pd.DataFrame, models: TrainedBPModels) -> None:
-    out_dir = get_output_dir()
-
-    df_pred = build_predictions_table(models, pm)
-    df_schema = build_feature_schema_table(models)
-    df_styles = build_player_styles_table(style_map)
-    df_snap = build_latest_snapshot(pm)
-
-    p1 = out_dir / OUT_PREDICTIONS
-    p2 = out_dir / OUT_FEATURE_SCHEMA
-    p3 = out_dir / OUT_PLAYER_STYLES
-    p4 = out_dir / OUT_LATEST_SNAPSHOT
-
-    df_pred.to_csv(p1, index=False)
-    df_schema.to_csv(p2, index=False)
-    df_styles.to_csv(p3, index=False)
-    df_snap.to_csv(p4, index=False)
-
-    print("\n================ POWER BI EXPORT COMPLETE ================")
-    print("Export folder:", out_dir)
-    print("Saved files:")
-    print(" -", p1)
-    print(" -", p2)
-    print(" -", p3)
-    print(" -", p4)
-    print("==========================================================\n")
-
-
-# %% 10) Main run
-
-def main():
-    print("Loading MCP style features + building clusters...")
-    style_map = build_player_style_clusters(CFG)
-    print(f"Style map size: {len(style_map):,}")
-
-    print("Loading ATP matches from GitHub...")
-    matches = load_atp_matches_github(CFG)
-    print(f"Loaded matches: {len(matches):,}")
-
-    print("Building player-match table...")
-    pm = derive_player_match_rows(matches)
-
-    print("Adding rolling features...")
-    pm = add_rolling_features(pm, CFG)
-
-    print("Adding style features...")
-    pm = add_style_features(pm, style_map)
-
-    print(f"Training rows after rolling filter: {len(pm):,}")
-    print(f"Unique players: {pm['player_name'].nunique():,}")
-
-    print("Training models...")
-    models = train_bp_models(pm, CFG)
-    print("Training complete.")
-
-    try:
-        eval_res = quick_eval_counts(pm, models, n_splits=5)
-        print("Quick eval (counts only):", eval_res)
-    except Exception as e:
-        print("Quick eval skipped:", e)
-
-    print("\nMODEL TRAIN FEATURE LIST (fit schema):")
-    print(models.numeric_cols + models.categorical_cols)
-
-    # Example 1
-    player = "Jannik Sinner"
-    opponent = "Novak Djokovic"
-    surface = "Hard"
-
-    X1 = build_forecast_row(
-        pm=pm,
-        player=player,
-        opponent=opponent,
-        surface=surface,
-        tourney_level="M",
-        best_of=3,
-        round_name="SF",
-        opponent_type_filters=None
-    )
-    X1 = align_features_for_prediction(X1, models)
-    out1 = forecast_break_points(models, X1)
-    print_bp_forecast(player, opponent, surface, out1)
-
-    # Example 2
-    player2 = "Jannik Sinner"
-    surface2 = "Hard"
-
-    opp_type_filters = {
-        "surface": surface2,
-        "opponent_type": "Baseline Grinder",
-        "opponent_rank_min": 1,
-        "opponent_rank_max": 30
-    }
-
-    X2 = build_forecast_row(
-        pm=pm,
-        player=player2,
-        opponent=None,
-        surface=surface2,
-        tourney_level="A",
-        best_of=3,
-        round_name="QF",
-        opponent_type_filters=opp_type_filters
-    )
-    X2 = align_features_for_prediction(X2, models)
-    out2 = forecast_break_points(models, X2)
-    print_bp_forecast(player2, "OpponentType(Top30 Baseline Grinder)", surface2, out2)
-
-    #Power BI export tables
-    export_powerbi_tables(style_map, pm, models)
-
+        print("No rows found for that match_id + focus_player in momentum_points_long.")
+        return
+
+    df = df.sort_values("point_index")
+    title = f"Momentum State Graph — {df['focus_player'].iloc[0]} vs {df['opponent'].iloc[0]} | {df['surface'].iloc[0]} | {int(df['year'].iloc[0])} {df['slam'].iloc[0]}"
+
+    x = df["point_index"].values
+    y = df["momentum_index"].values
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(x, y)
+    plt.axhline(0, linewidth=1)
+    plt.axhline(PHASE_POS_EDGE, linestyle="--", linewidth=1)
+    plt.axhline(PHASE_POS_DOMINANT, linestyle="--", linewidth=1)
+    plt.axhline(PHASE_NEG_EDGE, linestyle="--", linewidth=1)
+    plt.axhline(PHASE_NEG_DOMINANT, linestyle="--", linewidth=1)
+
+    big_win = df["just_won_big"].values.astype(bool)
+    big_loss = df["just_lost_big"].values.astype(bool)
+    plt.scatter(x[big_win], y[big_win], marker="^")
+    plt.scatter(x[big_loss], y[big_loss], marker="v")
+
+    plt.title(title)
+    plt.xlabel("Point index")
+    plt.ylabel("Momentum index (focus perspective)")
+    plt.tight_layout()
+    plt.show()
+
+    print("\nLast 8 mental cues:")
+    print(df[["point_index", "momentum_index", "momentum_phase", "mental_cue"]].tail(8).to_string(index=False))
+
+
+#%% main run 
 
 if __name__ == "__main__":
-    main()
+    # --- Choose years. For Sinner, start at 2020+ to guarantee he appears.
+    YEARS = list(range(2020, 2025))  # 2020-2024
+    SLAMS = ["ausopen", "frenchopen", "wimbledon", "usopen"]
+
+    # --- Filters (Power BI will do filtering later too; keep these light while testing)
+    FOCUS_PLAYER = "Sinner"       # substring match; "Jannik Sinner" also ok
+    SURFACE = None                # "Hard"/"Clay"/"Grass" or None
+    OPPONENT_NAME = None          # e.g. "Djokovic" (substring) or None
+    OPPONENT_TYPE = None          # e.g. "Big Server" or None (placeholder taxonomy)
+
+    # 1) Load
+    matches_all, points_all, loaded_pairs = load_slam_data(YEARS, SLAMS, verbose=True)
+
+    # 2) Merge
+    df_points = merge_points_matches(points_all, matches_all)
+    print("\nMerged points rows:", len(df_points))
+    print("Merged years:", sorted(df_points["year"].dropna().unique()))
+    print("Merged surfaces:", df_points["surface"].value_counts().to_dict())
+
+    # Confirm player exists
+    hits = find_player_candidates(df_points, FOCUS_PLAYER)
+    print(f"\nPlayers containing '{FOCUS_PLAYER}':", hits[:15])
+
+    # 3) Train expected model
+    expected_model = train_expected_point_model(df_points)
+
+    # 4) Build momentum tables
+    points_long, match_summary = build_momentum_tables(
+        df_points=df_points,
+        expected_model=expected_model,
+        focus_player_filter=FOCUS_PLAYER,
+        surface_filter=SURFACE,
+        opponent_filter=OPPONENT_NAME,
+        opponent_type_filter=OPPONENT_TYPE,
+        max_matches_after_filter=250
+    )
+
+    print("\nMatch summary (top 10):")
+    print(match_summary.head(10).to_string(index=False))
+
+    # 5) Export CSVs
+    export_for_power_bi(points_long, match_summary)
+
+    # 6) Plot one match
+    # Pick first match in summary:
+    mid = str(match_summary["match_id"].iloc[0])
+    fp_exact = str(match_summary["focus_player"].iloc[0])
+    plot_match_momentum(points_long, match_id=mid, focus_player=fp_exact)
+    
+#%% model evaluation
+
+
+print("\nmodel evaluation\n")
+
+# ----------------------------
+# 1) Expected Point Win Model
+#    Evaluate on a sample (fast + statistically stable)
+# ----------------------------
+feature_cols = ["surface", "score_bucket", "speed_bucket", "serve_number"]
+
+# Sample up to N points for evaluation
+N_EVAL = 200_000
+df_eval = df_points.sample(n=min(N_EVAL, len(df_points)), random_state=42)
+
+X_eval = df_eval[feature_cols]
+y_true = df_eval["point_won"].astype(int).values
+
+y_proba = expected_model.predict_proba(X_eval)[:, 1]
+y_pred = (y_proba >= 0.5).astype(int)
+
+print("EXPECTED POINT WIN MODEL (sampled evaluation)")
+print("--------------------------------------------")
+print("Rows used     :", len(df_eval))
+print("Accuracy      :", round(accuracy_score(y_true, y_pred), 4))
+print("ROC AUC       :", round(roc_auc_score(y_true, y_proba), 4))
+
+#  calibration curve
+prob_true, prob_pred = calibration_curve(y_true, y_proba, n_bins=10)
+
+plt.figure(figsize=(5, 5))
+plt.plot(prob_pred, prob_true, marker="o")
+plt.plot([0, 1], [0, 1], linestyle="--")
+plt.title("Calibration Curve (Expected Point Model)")
+plt.xlabel("Predicted Probability")
+plt.ylabel("Observed Frequency")
+plt.tight_layout()
+plt.show()
+
+
+
